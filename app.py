@@ -4,27 +4,41 @@ import json
 import os
 from datetime import datetime
 from io import BytesIO
+import time
 
 # --- 配置页面 ---
 st.set_page_config(page_title="🎣 渔具多仓库库存管理系统 (Web版)", layout="wide", page_icon="🎣")
 
 
-# --- 核心优化：添加缓存清除装饰器 ---
-# 告诉 Streamlit，load_data 的结果可以被缓存，但我们可以手动清除它
-@st.cache_data(ttl=60)  # 缓存60秒，或者手动清除
-def load_data_cached(token, repo_name, file_path):
+# --- 缓存管理 ---
+@st.cache_data(ttl=60)
+def load_data_cached(token, repo_name, file_path, _force_refresh=False):
+    """
+    加载数据。_force_refresh 用于强制绕过缓存重新请求（通过添加时间戳参数实现）
+    """
     if not token or not repo_name:
         return pd.DataFrame()
 
-    url = f"https://raw.githubusercontent.com/{repo_name}/main/{file_path}?t={datetime.now().timestamp()}"  # 添加时间戳防止浏览器缓存
+    # 添加随机数防止浏览器缓存 CSV
+    ts = datetime.now().timestamp() if _force_refresh else 0
+    url = f"https://raw.githubusercontent.com/{repo_name}/main/{file_path}?t={ts}"
+
     try:
         df = pd.read_csv(url)
         required_cols = ['id', 'warehouse', 'brand', 'item', 'quantity', 'image', 'updated_at']
         for col in required_cols:
             if col not in df.columns:
-                df[col] = "" if col in ['image', 'updated_at'] else (0 if col == 'quantity' else range(len(df)))
+                if col == 'id':
+                    df[col] = range(1, len(df) + 1)
+                elif col == 'quantity':
+                    df[col] = 0
+                else:
+                    df[col] = ""
+        # 确保列顺序
+        df = df[required_cols]
         return df
-    except Exception:
+    except Exception as e:
+        # 如果文件不存在，返回空结构
         return pd.DataFrame(columns=['id', 'warehouse', 'brand', 'item', 'quantity', 'image', 'updated_at'])
 
 
@@ -39,73 +53,92 @@ class GitHubDB:
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump([], f)
 
-    def load_data(self):
-        # 使用带缓存的加载函数，但通过 clear_cache 控制更新
-        return load_data_cached(self.token, self.repo_name, self.file_path)
+    def load_data(self, force_refresh=False):
+        return load_data_cached(self.token, self.repo_name, self.file_path, force_refresh)
 
-    def save_data(self, df):
-        """保存数据到 GitHub CSV"""
+    def save_data(self, df, max_retries=3):
+        """
+        保存数据到 GitHub，包含自动冲突重试机制
+        """
         if not self.token or not self.repo_name:
             return False, "❌ 未配置 GitHub Token 或 仓库名"
 
-        try:
-            from github import Github, Auth
+        from github import Github, Auth
+        from github.GithubException import GithubException
 
-            auth = Auth.Token(self.token)
-            g = Github(auth=auth)
-
-            # 验证
+        attempt = 0
+        while attempt < max_retries:
             try:
-                g.get_user()
-            except Exception as e:
-                return False, f"❌ Token 无效：{str(e)}"
-
-            try:
+                auth = Auth.Token(self.token)
+                g = Github(auth=auth)
                 repo = g.get_repo(self.repo_name)
-            except Exception as e:
-                return False, f"❌ 无法访问仓库：{str(e)}"
 
-            # 准备数据
-            csv_buffer = BytesIO()
-            required_cols = ['id', 'warehouse', 'brand', 'item', 'quantity', 'image', 'updated_at']
+                # 1. 准备数据
+                csv_buffer = BytesIO()
+                required_cols = ['id', 'warehouse', 'brand', 'item', 'quantity', 'image', 'updated_at']
 
-            for col in required_cols:
-                if col not in df.columns:
-                    if col == 'id':
-                        df[col] = range(1, len(df) + 1)
-                    elif col == 'quantity':
-                        df[col] = 0
+                # 确保列完整
+                for col in required_cols:
+                    if col not in df.columns:
+                        if col == 'id':
+                            df[col] = range(1, len(df) + 1)
+                        elif col == 'quantity':
+                            df[col] = 0
+                        else:
+                            df[col] = ""
+
+                df = df[required_cols]
+                df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+                content = csv_buffer.getvalue()
+
+                # 2. 获取当前最新的 SHA
+                sha = None
+                file_exists = True
+                try:
+                    contents = repo.get_contents(self.file_path, ref="main")
+                    sha = contents.sha
+                except Exception:
+                    file_exists = False
+
+                # 3. 尝试提交
+                msg_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                if file_exists:
+                    repo.update_file(
+                        path=self.file_path,
+                        message=f"Update: {msg_time}",
+                        content=content,
+                        sha=sha,
+                        branch="main"
+                    )
+                else:
+                    repo.create_file(
+                        path=self.file_path,
+                        message=f"Create: {msg_time}",
+                        content=content,
+                        branch="main"
+                    )
+
+                # 成功！清除缓存
+                load_data_cached.clear()
+                return True, "✅ 保存成功！"
+
+            except GithubException as e:
+                if e.status == 409 and "does not match" in str(e):
+                    # 发生冲突 (409)
+                    attempt += 1
+                    if attempt < max_retries:
+                        # 等待一小会儿，然后重试循环会自动重新获取最新 SHA
+                        time.sleep(0.5)
+                        continue
                     else:
-                        df[col] = ""
+                        return False, f"💥 冲突失败：经过 {max_retries} 次重试仍无法解决冲突。可能有人正在频繁修改。请刷新页面后重试。"
+                else:
+                    # 其他错误直接返回
+                    return False, f"💥 GitHub 错误 ({e.status}): {str(e)}"
+            except Exception as e:
+                return False, f"💥 未知错误：{type(e).__name__} - {str(e)}"
 
-            df = df[required_cols]
-            df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
-            content = csv_buffer.getvalue()
-
-            # 获取 SHA
-            sha = None
-            file_exists = True
-            try:
-                contents = repo.get_contents(self.file_path, ref="main")
-                sha = contents.sha
-            except Exception:
-                file_exists = False
-
-            # 提交
-            msg_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            if file_exists:
-                repo.update_file(path=self.file_path, message=f"Update: {msg_time}", content=content, sha=sha,
-                                 branch="main")
-            else:
-                repo.create_file(path=self.file_path, message=f"Create: {msg_time}", content=content, branch="main")
-
-            # 【关键修复】保存成功后，立即清除缓存，确保下次读取是最新的
-            load_data_cached.clear()
-
-            return True, "✅ 保存成功！"
-
-        except Exception as e:
-            return False, f"💥 保存失败：{type(e).__name__} - {str(e)}"
+        return False, "💥 未知循环错误"
 
     def add_history(self, action, details):
         try:
@@ -188,7 +221,6 @@ def render_inventory_view(df, warehouse, show_all=False):
         agg_df.rename(columns={'warehouse_list': '分布仓库'}, inplace=True)
         df_view = agg_df
 
-    # 使用 width="stretch" 替代 use_container_width
     st.dataframe(df_view, use_container_width=True, hide_index=True)
 
     total_qty = df_view['quantity'].sum()
@@ -224,7 +256,8 @@ def render_add_item():
             if not brand or not item:
                 st.error("品牌和物品不能为空！")
             else:
-                df = db.load_data()
+                # 每次操作前强制刷新一次数据，确保基于最新版本修改
+                df = db.load_data(force_refresh=True)
                 mask = (df['brand'] == brand) & (df['item'] == item) & (df['warehouse'] == warehouse)
 
                 if df[mask].empty:
@@ -245,21 +278,23 @@ def render_add_item():
                 if success:
                     st.success(msg)
                     db.add_history("新增/入库", msg)
-                    st.rerun()  # 强制刷新
+                    st.rerun()
                 else:
                     st.error(err)
+                    if "409" in err:
+                        st.info("💡 提示：数据冲突已自动重试。如果仍然失败，请点击侧边栏刷新或手动刷新浏览器页面。")
 
 
 def render_update_qty():
     st.header("✏️ 修改数量")
     if not db.token: st.stop()
-    df = db.load_data()
+    # 强制刷新获取最新数据
+    df = db.load_data(force_refresh=True)
     if df.empty: st.warning("无数据"); return
 
     df_wh = df[df['warehouse'] == current_warehouse]
     if df_wh.empty: st.warning(f"{current_warehouse} 无数据"); return
 
-    # 唯一键生成，防止 selectbox 缓存问题
     options = [f"{row['brand']} - {row['item']} (现有: {row['quantity']})" for _, row in df_wh.iterrows()]
     selected = st.selectbox("选择物品", options, key="upd_sel")
 
@@ -270,22 +305,29 @@ def render_update_qty():
         new_qty = st.number_input("新数量", min_value=0, value=current_qty, key="upd_qty")
 
         if st.button("更新", key="upd_btn"):
+            # 再次确保拿到最新数据以防万一
+            df = db.load_data(force_refresh=True)
             mask = (df['brand'] == b) & (df['item'] == i) & (df['warehouse'] == current_warehouse)
-            df.loc[mask, 'quantity'] = new_qty
-            df.loc[mask, 'updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            success, err = db.save_data(df)
-            if success:
-                st.success("更新成功")
-                db.add_history("修改数量", f"{b}-{i} -> {new_qty}")
-                st.rerun()
+
+            if not df[mask].empty:
+                df.loc[mask, 'quantity'] = new_qty
+                df.loc[mask, 'updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                success, err = db.save_data(df)
+                if success:
+                    st.success("更新成功")
+                    db.add_history("修改数量", f"{b}-{i} -> {new_qty}")
+                    st.rerun()
+                else:
+                    st.error(err)
             else:
-                st.error(err)
+                st.warning("物品未找到，可能已被删除。")
+                st.rerun()
 
 
 def render_transfer():
     st.header("🔄 跨仓调拨")
     if not db.token: st.stop()
-    df = db.load_data()
+    df = db.load_data(force_refresh=True)
     if df.empty: st.warning("无数据"); return
 
     c1, c2 = st.columns(2)
@@ -306,172 +348,16 @@ def render_transfer():
         qty = st.number_input("数量", min_value=1, max_value=max_qty, value=1, key="trans_qty")
 
         if st.button("执行调拨", key="trans_btn"):
+            df = db.load_data(force_refresh=True)  # 再次刷新
             mask_src = (df['brand'] == b) & (df['item'] == i) & (df['warehouse'] == src_wh)
-            df.loc[mask_src, 'quantity'] -= qty
-            if df.loc[mask_src, 'quantity'].values[0] <= 0:
-                df = df[~mask_src]
 
-            mask_dst = (df['brand'] == b) & (df['item'] == i) & (df['warehouse'] == dst_wh)
-            if df[mask_dst].empty:
-                new_id = int(df['id'].max()) + 1 if not df.empty and 'id' in df.columns else 1
-                new_row = pd.DataFrame([{
-                    'id': new_id, 'warehouse': dst_wh, 'brand': b, 'item': i,
-                    'quantity': qty, 'image': '', 'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }])
-                df = pd.concat([df, new_row], ignore_index=True)
-            else:
-                df.loc[mask_dst, 'quantity'] += qty
-                df.loc[mask_dst, 'updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not df[mask_src].empty and df.loc[mask_src, 'quantity'].values[0] >= qty:
+                df.loc[mask_src, 'quantity'] -= qty
+                if df.loc[mask_src, 'quantity'].values[0] <= 0:
+                    df = df[~mask_src]
 
-            success, err = db.save_data(df)
-            if success:
-                st.success(f"调拨成功：{qty} 件 {b}-{i} -> {dst_wh}")
-                db.add_history("调拨", f"{qty}件 {b}-{i}: {src_wh}->{dst_wh}")
-                st.rerun()
-            else:
-                st.error(err)
-
-
-def render_delete():
-    st.header("❌ 删除物品")
-    if not db.token: st.stop()
-    df = db.load_data()
-    df_wh = df[df['warehouse'] == current_warehouse]
-    if df_wh.empty: st.warning("无数据"); return
-
-    options = [f"{row['brand']} - {row['item']} (数量: {row['quantity']})" for _, row in df_wh.iterrows()]
-    sel = st.selectbox("选择记录", options, key="del_sel")
-
-    if sel and st.button("确认删除", type="primary", key="del_btn"):
-        parts = sel.split(" (数量: ")
-        b, i = parts[0].split(" - ")
-        mask = (df['brand'] == b) & (df['item'] == i) & (df['warehouse'] == current_warehouse)
-
-        # 再次确认数据存在
-        if not df[mask].empty:
-            df = df[~mask]
-            success, err = db.save_data(df)
-            if success:
-                st.success("删除成功！列表将刷新...")
-                db.add_history("删除", f"{b}-{i}")
-                st.rerun()  # 强制刷新页面，重新加载数据
-            else:
-                st.error(err)
-        else:
-            st.warning("该物品似乎已被删除或不存在。")
-            st.rerun()
-
-
-def render_import_excel():
-    st.header("📥 Excel 导入")
-    uploaded = st.file_uploader("上传 Excel", type=['xlsx', 'xls'], key="imp_file")
-    target_wh = st.selectbox("导入到", get_default_warehouses(), key="imp_wh")
-
-    if uploaded:
-        try:
-            df_in = pd.read_excel(uploaded)
-            if not all(k in df_in.columns for k in ['品牌', '物品', '数量']):
-                st.error("缺少列：品牌，物品，数量")
-                st.stop()
-
-            df_in = df_in.rename(columns={'品牌': 'brand', '物品': 'item', '数量': 'quantity', '图片路径': 'image'})
-            df_in['warehouse'] = target_wh
-            df_in['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if 'image' not in df_in.columns: df_in['image'] = ""
-
-            df_curr = db.load_data()
-            count_add, count_upd = 0, 0
-
-            for _, row in df_in.iterrows():
-                mask = (df_curr['brand'] == row['brand']) & (df_curr['item'] == row['item']) & (
-                            df_curr['warehouse'] == target_wh)
-                if df_curr[mask].empty:
-                    new_id = int(df_curr['id'].max()) + 1 if not df_curr.empty and 'id' in df_curr.columns else 1
+                mask_dst = (df['brand'] == b) & (df['item'] == i) & (df['warehouse'] == dst_wh)
+                if df[mask_dst].empty:
+                    new_id = int(df['id'].max()) + 1 if not df.empty and 'id' in df.columns else 1
                     new_row = pd.DataFrame([{
-                        'id': new_id, 'warehouse': target_wh, 'brand': row['brand'], 'item': row['item'],
-                        'quantity': int(row['quantity']), 'image': row.get('image', ''),
-                        'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }])
-                    df_curr = pd.concat([df_curr, new_row], ignore_index=True)
-                    count_add += 1
-                else:
-                    df_curr.loc[mask, 'quantity'] += int(row['quantity'])
-                    df_curr.loc[mask, 'updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    count_upd += 1
-
-            success, err = db.save_data(df_curr)
-            if success:
-                st.success(f"导入完成：新增 {count_add}, 更新 {count_upd}")
-                db.add_history("导入", f"{uploaded.name}: +{count_add}, ~{count_upd}")
-                st.rerun()
-            else:
-                st.error(err)
-        except Exception as e:
-            st.error(f"读取失败：{e}")
-
-
-def render_export_excel():
-    st.header("📤 Excel 导出")
-    df = db.load_data()
-    if df.empty: st.warning("无数据"); return
-
-    export_df = df[['warehouse', 'brand', 'item', 'quantity', 'image']].copy()
-    export_df.columns = ['仓库', '品牌', '物品', '数量', '图片路径']
-
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        export_df.to_excel(writer, index=False)
-
-    st.download_button("下载 Excel", buffer.getvalue(), f"inventory_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_btn")
-
-
-def render_history():
-    st.header("📝 修改历史")
-    history = db.get_history()
-    if not history:
-        st.info("暂无记录")
-    else:
-        for r in reversed(history[-20:]):
-            st.markdown(f"**[{r['timestamp']}] {r['action']}**: {r['details']}")
-            st.divider()
-
-
-def render_status():
-    st.header("🔧 系统状态")
-    if db.token:
-        st.success("✅ Token 已配置")
-        st.success(f"✅ 仓库：{db.repo_name}")
-        # 强制刷新一次数据以显示最新状态
-        if st.button("刷新数据状态"):
-            load_data_cached.clear()
-            st.rerun()
-        df = db.load_data()
-        st.metric("记录数", len(df))
-    else:
-        st.error("❌ 未配置 Token")
-
-
-# --- 路由 ---
-if choice == "📦 库存总览":
-    tab1, tab2 = st.tabs(["当前仓库", "全仓汇总"])
-    with tab1:
-        render_inventory_view(db.load_data(), current_warehouse, False)
-    with tab2:
-        render_inventory_view(db.load_data(), "", True)
-elif choice == "➕ 新增/入库":
-    render_add_item()
-elif choice == "✏️ 修改数量":
-    render_update_qty()
-elif choice == "🔄 跨仓调拨":
-    render_transfer()
-elif choice == "❌ 删除物品":
-    render_delete()
-elif choice == "📥 Excel导入":
-    render_import_excel()
-elif choice == "📤 Excel导出":
-    render_export_excel()
-elif choice == "📝 修改历史":
-    render_history()
-elif choice == "🔧 系统状态":
-    render_status()
+                        'id': new_id, 'warehouse': dst_wh, 'brand':
