@@ -1,219 +1,279 @@
 import streamlit as st
 import pandas as pd
 import database as db
-import os
 from datetime import datetime
 
 # 页面配置
-st.set_page_config(page_title="渔具库存管理系统", page_icon="🎣", layout="wide")
+st.set_page_config(page_title="🎣 渔具库存管理系统 (GitHub 版)", page_icon="🎣", layout="wide")
 
 # 标题
-st.title("🎣 智能渔具库存管理系统 (Web版)")
+st.title("🎣 智能渔具库存管理系统 (永久存储版)")
+st.markdown("""
+<style>
+    .metric-card {background-color: #f0f2f6; padding: 10px; border-radius: 10px;}
+</style>
+""", unsafe_allow_html=True)
 
-# 侧边栏：功能选择
-menu = ["库存总览", "新增物品", "编辑/出入库", "库存预警", "出入库日志"]
+# 侧边栏
+menu = ["📦 库存总览", "➕ 新增物品", "✏️ 编辑/出入库", "⚠️ 库存预警", "🔧 系统状态"]
 choice = st.sidebar.selectbox("功能菜单", menu)
 
 
 # --- 辅助函数 ---
-def load_data():
-    rows = db.get_all_items()
-    if not rows:
-        return pd.DataFrame()
+@st.cache_data(ttl=60)  # 缓存 60 秒，避免频繁请求 GitHub
+def get_cached_data():
+    return db.load_data()
 
-    # 转换为 DataFrame
-    columns = [col[0] for col in rows[0].keys()]
-    df = pd.DataFrame(rows, columns=columns)
 
-    # 计算状态列
-    df['状态'] = df.apply(lambda x: '⚠️ 缺货' if x['quantity'] <= x['min_stock'] else '✅ 充足', axis=1)
-    return df
+def refresh_data():
+    st.cache_data.clear()
+    st.rerun()
 
 
 # --- 页面逻辑 ---
 
-if choice == "库存总览":
-    st.header("📦 当前库存概览")
+if choice == "📦 库存总览":
+    st.header("当前库存概览")
 
-    df = load_data()
+    # 检查配置
+    if not db.GITHUB_TOKEN:
+        st.error("⚠️ **未检测到 GitHub Token！** 请在 Streamlit 后台 Secrets 中配置 `GITHUB_TOKEN` 和 `GITHUB_REPO`。")
+        st.stop()
+
+    df = get_cached_data()
 
     if df.empty:
-        st.info("暂无库存数据，请去'新增物品'添加。")
+        st.info("📭 暂无库存数据。请点击左侧菜单【新增物品】添加第一批渔具。")
     else:
         # 统计卡片
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("物品种类", len(df))
-        col2.metric("总库存数量", df['quantity'].sum())
-        col3.metric("仓库总数", df['warehouse'].nunique())
-        low_stock_count = len(df[df['quantity'] <= df['min_stock']])
-        col4.metric("低库存预警", low_stock_count, delta_color="inverse")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("物品种类", len(df))
+        c2.metric("总库存数量", df['quantity'].sum())
+        c3.metric("仓库分布", df['warehouse'].nunique())
+        low_stock = len(df[df['quantity'] <= df['min_stock']])
+        c4.metric("低库存预警", low_stock, delta_color="inverse")
 
-        # 搜索与过滤
-        col_search, col_wh = st.columns([3, 1])
-        with col_search:
-            search_term = st.text_input("🔍 搜索 (品牌/名称/类别)", "")
-        with col_wh:
-            wh_filter = st.selectbox("筛选仓库", ["全部"] + list(df['warehouse'].unique()))
+        # 搜索过滤
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            search = st.text_input("🔍 搜索 (品牌/名称/类别)", "")
+        with col2:
+            wh_filter = st.selectbox("筛选仓库", ["全部"] + sorted(df['warehouse'].unique()))
 
-        # 应用过滤
-        mask = (df['brand'].str.contains(search_term, case=False) |
-                df['name'].str.contains(search_term, case=False) |
-                df['category'].str.contains(search_term, case=False))
+        # 过滤逻辑
+        mask = (df['brand'].str.contains(search, case=False, na=False) |
+                df['name'].str.contains(search, case=False, na=False) |
+                df['category'].str.contains(search, case=False, na=False))
         if wh_filter != "全部":
             mask &= (df['warehouse'] == wh_filter)
 
-        filtered_df = df[mask]
+        view_df = df[mask].copy()
 
 
-        # 显示表格 (使用样式高亮低库存)
-        def color_low_stock(val):
-            color = '#ffcccc' if val == '⚠️ 缺货' else '#ffffff'
-            return f'background-color: {color}'
+        # 状态列
+        def get_status(qty, min_q):
+            return "⚠️ 缺货" if qty <= min_q else "✅ 充足"
+
+
+        view_df['状态'] = view_df.apply(lambda x: get_status(x['quantity'], x['min_stock']), axis=1)
+
+
+        # 样式高亮
+        def color_status(val):
+            return 'background-color: #ffcccc' if val == "⚠️ 缺货" else ''
 
 
         st.dataframe(
-            filtered_df.style.applymap(color_low_stock, subset=['状态']),
+            view_df.style.applymap(color_status, subset=['状态']),
             use_container_width=True,
             hide_index=True
         )
 
-elif choice == "新增物品":
-    st.header("➕ 新增入库")
+elif choice == "➕ 新增物品":
+    st.header("新增入库")
+
+    if not db.GITHUB_TOKEN:
+        st.error("请先配置 GitHub Token (见🔧 系统状态)。")
+        st.stop()
 
     with st.form("add_form"):
-        col1, col2 = st.columns(2)
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             brand = st.text_input("品牌 (Brand)*", required=True)
             name = st.text_input("物品名称 (Name)*", required=True)
-            category = st.selectbox("类别", ["鱼钩", "鱼线", "拟饵", "配件", "竿稍", "其他"])
-            warehouse = st.selectbox("所属仓库", ["主仓库", "分店A", "分店B", "车载箱"])
-            location = st.text_input("库位 (如 A-01-2)", "")
+            category = st.selectbox("类别", ["鱼钩", "鱼线", "拟饵", "配件", "鱼竿", "其他"])
+            warehouse = st.selectbox("所属仓库", ["主仓库", "分店A", "车载箱", "家中"])
+            location = st.text_input("库位 (如 A-01)", "")
             quantity = st.number_input("初始数量", min_value=0, value=0)
-        with col2:
-            min_stock = st.number_input("最低库存预警值", min_value=0, value=5)
+        with c2:
+            min_stock = st.number_input("最低库存预警", min_value=0, value=5)
             unit_price = st.number_input("单价 (元)", min_value=0.0, step=0.1)
-            batch_no = st.text_input("生产批次号", "")
+            batch_no = st.text_input("批次号", "")
             expiry_date = st.date_input("过期日期 (可选)", value=None)
-            # 图片上传 (简化版：仅存文件名，实际需配置上传文件夹)
-            # uploaded_file = st.file_uploader("上传产品图", type=['png', 'jpg'])
 
-        submitted = st.form_submit_button("保存入库")
+        submitted = st.form_submit_button("💾 保存并同步到 GitHub")
 
         if submitted:
-            try:
-                db.add_item(brand, name, category, warehouse, location, quantity, min_stock, unit_price, batch_no,
-                            expiry_date)
-                st.success(f"✅ {brand} - {name} 已成功入库！")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ 发生错误: {e}")
+            with st.spinner("正在连接 GitHub 并写入数据..."):
+                success, msg = db.add_item(brand, name, category, warehouse, location, quantity, min_stock, unit_price,
+                                           batch_no, expiry_date)
+                if success:
+                    st.success(msg)
+                    refresh_data()
+                else:
+                    st.error(msg)
 
-elif choice == "编辑/出入库":
-    st.header("✏️ 编辑与快速出入库")
+elif choice == "✏️ 编辑/出入库":
+    st.header("编辑与快速出入库")
 
-    df = load_data()
+    if not db.GITHUB_TOKEN:
+        st.error("请先配置 GitHub Token。")
+        st.stop()
+
+    df = get_cached_data()
     if df.empty:
-        st.warning("暂无数据。")
+        st.warning("暂无数据可编辑。")
     else:
         # 选择物品
-        item_list = df['id'].astype(str) + " - " + df['brand'] + " " + df['name'] + " (" + df['warehouse'] + ")"
-        selected_option = st.selectbox("选择要操作的物品", item_list)
+        df['display'] = df['id'].astype(str) + " - " + df['brand'] + " " + df['name'] + " (" + df['warehouse'] + ")"
+        selected_str = st.selectbox("选择物品", df['display'])
 
-        if selected_option:
-            selected_id = int(selected_option.split(" - ")[0])
-            item_data = df[df['id'] == selected_id].iloc[0]
+        if selected_str:
+            selected_id = int(selected_str.split(" - ")[0])
+            item = df[df['id'] == selected_id].iloc[0]
 
-            st.subheader(f"当前库存: {item_data['quantity']} (预警线: {item_data['min_stock']})")
+            st.subheader(f"当前库存: **{item['quantity']}** (预警线: {item['min_stock']})")
 
             # 快速出入库
-            col_q1, col_q2, col_q3 = st.columns([1, 1, 2])
-            with col_q1:
-                change_qty = st.number_input("变动数量", min_value=1, value=1)
-            with col_q2:
-                action_type = st.selectbox("操作类型", ["入库 (+)", "出库 (-)"])
-            with col_q3:
-                reason = st.text_input("备注原因", "日常补货/销售")
+            with st.expander("⚡ 快速出入库 (不修改其他信息)"):
+                c1, c2, c3 = st.columns([1, 1, 2])
+                with c1:
+                    change_qty = st.number_input("数量", min_value=1, value=1)
+                with c2:
+                    action = st.selectbox("类型", ["入库 (+)", "出库 (-)"])
+                with c3:
+                    reason = st.text_input("备注", "手动调整")
 
-            if st.button("执行变动"):
-                new_qty = item_data['quantity'] + change_qty if "入库" in action_type else item_data[
-                                                                                             'quantity'] - change_qty
-                if new_qty < 0:
-                    st.error("❌ 库存不能为负数！")
-                else:
-                    # 更新数据库
-                    db.update_item(
-                        selected_id, item_data['brand'], item_data['name'], item_data['category'],
-                        item_data['warehouse'], item_data['location'], new_qty,
-                        item_data['min_stock'], item_data['unit_price'],
-                        item_data['batch_no'], item_data['expiry_date']
-                    )
-                    st.success(f"✅ 操作成功！新库存: {new_qty}")
-                    st.rerun()
+                if st.button("执行变动"):
+                    new_qty = item['quantity'] + change_qty if "入库" in action else item['quantity'] - change_qty
+                    if new_qty < 0:
+                        st.error("❌ 库存不能为负数！")
+                    else:
+                        with st.spinner("同步中..."):
+                            success, msg = db.update_item(selected_id, quantity=new_qty)
+                            if success:
+                                st.success(f"{msg} 新库存: {new_qty}")
+                                refresh_data()
+                            else:
+                                st.error(msg)
 
             st.divider()
 
-            # 完整编辑表单
-            st.write("### 完整信息编辑")
-            with st.form("edit_form"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    ed_brand = st.text_input("品牌", value=item_data['brand'])
-                    ed_name = st.text_input("名称", value=item_data['name'])
-                    ed_cat = st.selectbox("类别", ["鱼钩", "鱼线", "拟饵", "配件", "竿稍", "其他"],
-                                          index=["鱼钩", "鱼线", "拟饵", "配件", "竿稍", "其他"].index(item_data['category']) if
-                                          item_data['category'] in ["鱼钩", "鱼线", "拟饵", "配件", "竿稍", "其他"] else 5)
-                    ed_wh = st.text_input("仓库", value=item_data['warehouse'])
-                    ed_loc = st.text_input("库位", value=item_data['location'])
-                with c2:
-                    ed_min = st.number_input("最低库存", value=int(item_data['min_stock']))
-                    ed_price = st.number_input("单价", value=float(item_data['unit_price']))
-                    ed_batch = st.text_input("批次", value=item_data['batch_no'] if item_data['batch_no'] else "")
-                    ed_exp = st.date_input("过期日", value=item_data['expiry_date'] if item_data['expiry_date'] else None)
+            # 完整编辑
+            st.write("### 📝 完整信息编辑")
+            with st.form("edit_full"):
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    ed_brand = st.text_input("品牌", value=item['brand'])
+                    ed_name = st.text_input("名称", value=item['name'])
+                    ed_cat = st.selectbox("类别", ["鱼钩", "鱼线", "拟饵", "配件", "鱼竿", "其他"],
+                                          index=["鱼钩", "鱼线", "拟饵", "配件", "鱼竿", "其他"].index(item['category']) if item[
+                                                                                                                    'category'] in [
+                                                                                                                    "鱼钩",
+                                                                                                                    "鱼线",
+                                                                                                                    "拟饵",
+                                                                                                                    "配件",
+                                                                                                                    "鱼竿",
+                                                                                                                    "其他"] else 5)
+                    ed_wh = st.text_input("仓库", value=item['warehouse'])
+                    ed_loc = st.text_input("库位", value=item['location'])
+                with ec2:
+                    ed_min = st.number_input("最低库存", value=int(item['min_stock']))
+                    ed_price = st.number_input("单价", value=float(item['unit_price']))
+                    ed_batch = st.text_input("批次", value=item['batch_no'])
+                    # 处理日期
+                    try:
+                        ed_exp_val = datetime.strptime(str(item['expiry_date']), "%Y-%m-%d").date() if item[
+                                                                                                           'expiry_date'] and str(
+                            item['expiry_date']) != "nan" else None
+                    except:
+                        ed_exp_val = None
+                    ed_exp = st.date_input("过期日", value=ed_exp_val)
 
                 col_del, col_save = st.columns([1, 4])
                 with col_del:
                     if st.button("🗑️ 删除此物品", type="secondary"):
-                        if st.checkbox("确认删除？"):
-                            db.delete_item(selected_id)
-                            st.success("已删除")
-                            st.rerun()
+                        if st.checkbox("确认删除？此操作不可逆"):
+                            with st.spinner("删除中..."):
+                                success, msg = db.delete_item(selected_id)
+                                if success:
+                                    st.success("已删除")
+                                    refresh_data()
+                                else:
+                                    st.error(msg)
                 with col_save:
                     if st.form_submit_button("💾 保存修改"):
-                        # 注意：这里直接保存会覆盖刚才的快速出入库结果，实际逻辑应更严谨
-                        # 为简化演示，这里只更新非数量字段，数量由上面的快速出入库控制
-                        # 若要全量更新，需重新获取最新数量
-                        current_row = db.get_all_items()  # 重新拉取最新
-                        # 简单处理：直接用表单里的数量（如果用户改了）或者保持原样
-                        # 此处为了逻辑清晰，建议只允许在表单里改属性，数量用上面的按钮
-                        # 但为了功能完整，我们假设用户可能在这里也改了数量
-                        final_qty = st.session_state.get('final_qty',
-                                                         item_data['quantity'])  # 这里需要更复杂的session状态管理，简化起见略过
+                        with st.spinner("同步中..."):
+                            success, msg = db.update_item(
+                                selected_id,
+                                brand=ed_brand, name=ed_name, category=ed_cat,
+                                warehouse=ed_wh, location=ed_loc,
+                                min_stock=ed_min, unit_price=ed_price,
+                                batch_no=ed_batch, expiry_date=ed_exp
+                            )
+                            if success:
+                                st.success(msg)
+                                refresh_data()
+                            else:
+                                st.error(msg)
 
-                        # 简单调用更新，实际项目中应合并逻辑
-                        db.update_item(selected_id, ed_brand, ed_name, ed_cat, ed_wh, ed_loc, item_data['quantity'],
-                                       ed_min, ed_price, ed_batch, ed_exp)
-                        st.success("信息已更新")
-                        st.rerun()
-
-elif choice == "库存预警":
-    st.header("⚠️ 低库存预警列表")
-    df = load_data()
+elif choice == "⚠️ 库存预警":
+    st.header("低库存预警列表")
+    df = get_cached_data()
     if df.empty:
         st.info("无数据")
     else:
         warning_df = df[df['quantity'] <= df['min_stock']]
         if warning_df.empty:
-            st.success("🎉 所有库存充足！")
+            st.success("🎉 所有库存充足！无需补货。")
         else:
-            st.dataframe(warning_df[['brand', 'name', 'warehouse', 'location', 'quantity', 'min_stock', '状态']],
-                         use_container_width=True)
-
-            # 简单的图表
+            st.dataframe(warning_df[['brand', 'name', 'warehouse', 'quantity', 'min_stock']], use_container_width=True)
             st.bar_chart(warning_df.set_index('name')['quantity'])
 
-elif choice == "出入库日志":
-    st.header("📜 操作审计日志")
-    conn = db.get_connection()
-    log_df = pd.read_sql_query("SELECT * FROM logs ORDER BY timestamp DESC LIMIT 50", conn)
-    conn.close()
-    st.dataframe(log_df, use_container_width=True)
+elif choice == "🔧 系统状态":
+    st.header("系统配置检查")
+
+    st.write("### 1. GitHub 连接状态")
+    if db.GITHUB_TOKEN and db.REPO_NAME:
+        st.success("✅ Token 和 仓库名 已配置")
+        st.info(f"当前仓库: `{db.REPO_NAME}`")
+        st.write("💡 **提示**: 数据将保存在该仓库的 `inventory.csv` 文件中。您可以去 GitHub 查看该文件验证数据。")
+
+        # 测试连接
+        repo = db.get_repo()
+        if repo:
+            st.success("✅ 成功连接到 GitHub 仓库！")
+            try:
+                content = repo.get_contents("inventory.csv")
+                st.success(f"✅ 找到数据文件 `inventory.csv` (大小: {content.size} bytes)")
+            except:
+                st.warning("⚠️ 暂未找到 `inventory.csv` 文件。这是正常的，当您第一次添加物品时会自动创建。")
+        else:
+            st.error("❌ 无法连接 GitHub。请检查 Token 是否有 `repo` 权限，以及仓库名是否正确。")
+    else:
+        st.error("❌ 缺少配置。请按以下步骤操作：")
+        st.code("""
+        1. 点击 Streamlit 页面右上角的三个点 (...) -> Secrets
+        2. 输入以下内容：
+
+        GITHUB_TOKEN = "ghp_你的长串Token"
+        GITHUB_REPO = "你的用户名/你的仓库名"
+        """)
+
+    st.divider()
+    st.write("### 2. 关于数据持久化")
+    st.markdown("""
+    - **原理**: 每次保存时，程序会自动向您的 GitHub 仓库提交一个 `inventory.csv` 文件的更新。
+    - **安全性**: 数据存储在 GitHub 服务器上，即使 Streamlit 重启，数据也不会丢失。
+    - **版本控制**: 您可以在 GitHub 仓库的 "Commits" 中看到每一次库存变动的记录，随时可以回滚到旧版本。
+    """)

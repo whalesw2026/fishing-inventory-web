@@ -1,126 +1,142 @@
-import sqlite3
 import os
+import pandas as pd
+import base64
+from io import StringIO
+from github import Github
 from datetime import datetime
 
-DB_FILE = 'inventory.db'
+# 配置项：从 Streamlit Secrets 获取
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO_NAME = os.getenv("GITHUB_REPO")  # 格式：username/repo-name
+CSV_FILENAME = "inventory.csv"
 
 
-def get_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # 让结果可以用列名访问
-    return conn
+def get_repo():
+    """获取 GitHub 仓库对象"""
+    if not GITHUB_TOKEN or not REPO_NAME:
+        return None
+    try:
+        g = Github(GITHUB_TOKEN)
+        return g.get_repo(REPO_NAME)
+    except Exception as e:
+        print(f"GitHub 连接错误: {e}")
+        return None
 
 
-def init_db():
-    """初始化数据库，创建表如果不存在"""
-    conn = get_connection()
-    c = conn.cursor()
+def load_data():
+    """从 GitHub 加载 CSV 数据"""
+    repo = get_repo()
 
-    # 创建库存表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            brand TEXT NOT NULL,
-            name TEXT NOT NULL,
-            category TEXT,
-            warehouse TEXT NOT NULL,
-            location TEXT,
-            quantity INTEGER DEFAULT 0,
-            min_stock INTEGER DEFAULT 5,
-            unit_price REAL,
-            image_path TEXT,
-            batch_no TEXT,
-            expiry_date TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    # 如果未配置 Token，返回空结构（避免报错）
+    if not repo:
+        return get_empty_df()
 
-    # 创建出入库记录表 (审计日志)
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id INTEGER,
-            action TEXT, -- 'IN', 'OUT', 'ADJUST', 'TRANSFER'
-            quantity_change INTEGER,
-            reason TEXT,
-            operator TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
+    try:
+        # 尝试获取文件内容
+        file_content = repo.get_contents(CSV_FILENAME)
+        # GitHub API 返回的是 base64 编码，需要解码
+        decoded_content = base64.b64decode(file_content.content).decode('utf-8')
+        df = pd.read_csv(StringIO(decoded_content))
+        # 确保数据类型正确
+        df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int)
+        df['min_stock'] = pd.to_numeric(df['min_stock'], errors='coerce').fillna(5).astype(int)
+        return df
+    except Exception as e:
+        # 如果文件不存在（404），返回空 DataFrame
+        if "404" in str(e):
+            return get_empty_df()
+        print(f"加载数据失败: {e}")
+        return get_empty_df()
 
 
-def get_all_items():
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('SELECT * FROM items ORDER BY warehouse, brand, name')
-    rows = c.fetchall()
-    conn.close()
-    return rows
+def save_data(df):
+    """将 DataFrame 保存为 CSV 推送到 GitHub"""
+    repo = get_repo()
+    if not repo:
+        return False, "错误：未配置 GitHub Token 或仓库名。请在 Streamlit Secrets 中设置。"
 
+    try:
+        # 将 DataFrame 转为 CSV 字符串
+        csv_str = df.to_csv(index=False)
+
+        # 检查文件是否已存在，以获取 sha (更新文件必须提供 sha)
+        try:
+            file_content = repo.get_contents(CSV_FILENAME)
+            sha = file_content.sha
+            message = f"Update inventory: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            repo.update_file(CSV_FILENAME, message, csv_str, sha)
+        except Exception:
+            # 文件不存在，创建新文件
+            message = "Initial commit: Create inventory database"
+            repo.create_file(CSV_FILENAME, message, csv_str)
+
+        return True, "✅ 数据已成功同步到 GitHub！"
+    except Exception as e:
+        return False, f"❌ 同步失败: {str(e)}"
+
+
+def get_empty_df():
+    """返回空的 DataFrame 结构"""
+    columns = ['id', 'brand', 'name', 'category', 'warehouse', 'location',
+               'quantity', 'min_stock', 'unit_price', 'batch_no', 'expiry_date',
+               'created_at', 'updated_at']
+    return pd.DataFrame(columns=columns)
+
+
+# --- 业务逻辑接口 ---
 
 def add_item(brand, name, category, warehouse, location, quantity, min_stock, unit_price, batch_no, expiry_date):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO items (brand, name, category, warehouse, location, quantity, min_stock, unit_price, batch_no, expiry_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (brand, name, category, warehouse, location, quantity, min_stock, unit_price, batch_no, expiry_date))
+    df = load_data()
 
-    # 记录日志
-    item_id = c.lastrowid
-    c.execute('''
-        INSERT INTO logs (item_id, action, quantity_change, reason, operator)
-        VALUES (?, 'INIT', ?, 'Initial stock entry', 'System')
-    ''', (item_id, quantity))
+    # 生成新 ID
+    new_id = 1 if df.empty else int(df['id'].max()) + 1
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn.commit()
-    conn.close()
-    return True
+    new_row = {
+        'id': new_id,
+        'brand': brand,
+        'name': name,
+        'category': category,
+        'warehouse': warehouse,
+        'location': location,
+        'quantity': int(quantity),
+        'min_stock': int(min_stock),
+        'unit_price': float(unit_price),
+        'batch_no': batch_no,
+        'expiry_date': str(expiry_date) if expiry_date else "",
+        'created_at': now,
+        'updated_at': now
+    }
+
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    return save_data(df)
 
 
-def update_item(item_id, brand, name, category, warehouse, location, quantity, min_stock, unit_price, batch_no,
-                expiry_date):
-    conn = get_connection()
-    c = conn.cursor()
+def update_item(item_id, **kwargs):
+    df = load_data()
 
-    # 获取旧数量以记录日志
-    c.execute('SELECT quantity FROM items WHERE id = ?', (item_id,))
-    old_qty = c.fetchone()[0]
+    if item_id not in df['id'].values:
+        return False, "物品 ID 不存在"
 
-    c.execute('''
-        UPDATE items 
-        SET brand=?, name=?, category=?, warehouse=?, location=?, quantity=?, min_stock=?, unit_price=?, batch_no=?, expiry_date=?, updated_at=?
-        WHERE id=?
-    ''', (
-    brand, name, category, warehouse, location, quantity, min_stock, unit_price, batch_no, expiry_date, datetime.now(),
-    item_id))
+    # 更新字段
+    kwargs['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 记录数量变动日志
-    if quantity != old_qty:
-        diff = quantity - old_qty
-        action = 'IN' if diff > 0 else 'OUT'
-        c.execute('''
-            INSERT INTO logs (item_id, action, quantity_change, reason, operator)
-            VALUES (?, ?, ?, 'Manual adjustment', 'User')
-        ''', (item_id, action, diff))
+    # 确保数值类型
+    if 'quantity' in kwargs: kwargs['quantity'] = int(kwargs['quantity'])
+    if 'min_stock' in kwargs: kwargs['min_stock'] = int(kwargs['min_stock'])
+    if 'unit_price' in kwargs: kwargs['unit_price'] = float(kwargs['unit_price'])
+    if 'expiry_date' in kwargs: kwargs['expiry_date'] = str(kwargs['expiry_date']) if kwargs['expiry_date'] else ""
 
-    conn.commit()
-    conn.close()
-    return True
+    for key, value in kwargs.items():
+        df.loc[df['id'] == item_id, key] = value
+
+    return save_data(df)
 
 
 def delete_item(item_id):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute('DELETE FROM items WHERE id = ?', (item_id,))
-    conn.commit()
-    conn.close()
-    return True
+    df = load_data()
+    if item_id not in df['id'].values:
+        return False, "物品 ID 不存在"
 
-
-# 初始化数据库 (每次导入时运行一次)
-init_db()
+    df = df[df['id'] != item_id]
+    return save_data(df)
