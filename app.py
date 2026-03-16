@@ -45,37 +45,87 @@ class GitHubDB:
     def save_data(self, df):
         """保存数据到 GitHub CSV"""
         if not self.token or not self.repo_name:
-            return False, "未配置 GitHub Token 或 仓库名"
+            return False, "❌ 错误：未配置 GitHub Token 或 仓库名 (请检查 Secrets)"
 
         try:
-            from github import Github
-            g = Github(self.token)
-            repo = g.get_repo(self.repo_name)
+            from github import Github, Auth
+
+            # 【修复点】使用新的认证方式
+            auth = Auth.Token(self.token)
+            g = Github(auth=auth)
+
+            # 测试连接：获取当前用户信息（验证 Token 有效性）
+            try:
+                user = g.get_user()
+                # print(f"✅ Token 有效，当前用户：{user.login}") # 生产环境可注释掉以减少日志
+            except Exception as auth_err:
+                return False, f"❌ Token 无效或过期：{str(auth_err)}"
+
+            # 获取仓库
+            try:
+                repo = g.get_repo(self.repo_name)
+                # print(f"✅ 成功连接到仓库：{repo.full_name}")
+            except Exception as repo_err:
+                return False, f"❌ 无法访问仓库 '{self.repo_name}'：{str(repo_err)}\n(请检查仓库名格式是否为 '用户名/仓库名' 且 Token 有权限)"
 
             # 准备文件内容
             csv_buffer = BytesIO()
+            # 确保包含所有必要列，防止列丢失
+            required_cols = ['id', 'warehouse', 'brand', 'item', 'quantity', 'image', 'updated_at']
+            for col in required_cols:
+                if col not in df.columns:
+                    if col == 'quantity':
+                        df[col] = 0
+                    elif col == 'id':
+                        # 如果没ID列，尝试生成一个简单的序列
+                        df[col] = range(1, len(df) + 1)
+                    else:
+                        df[col] = ""
+
+            # 重新排列列顺序，确保一致性
+            df = df[required_cols]
+
             df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
             content = csv_buffer.getvalue()
 
             # 获取现有文件 SHA (如果是更新)
             sha = None
+            file_exists = True
             try:
-                contents = repo.get_contents(self.file_path)
+                # 明确指定分支为 main
+                contents = repo.get_contents(self.file_path, ref="main")
                 sha = contents.sha
-            except:
-                pass
+            except Exception:
+                file_exists = False
 
-            # 提交
-            repo.update_file(
-                path=self.file_path,
-                message=f"Update inventory: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                content=content,
-                sha=sha,
-                branch="main"
-            )
-            return True, "保存成功"
+            # 提交操作
+            message = f"Update inventory: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+            if file_exists:
+                repo.update_file(
+                    path=self.file_path,
+                    message=message,
+                    content=content,
+                    sha=sha,
+                    branch="main"
+                )
+            else:
+                repo.create_file(
+                    path=self.file_path,
+                    message=f"Create inventory: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    content=content,
+                    branch="main"
+                )
+
+            return True, "✅ 保存成功！数据已同步至 GitHub。"
+
         except Exception as e:
-            return False, str(e)
+            # 捕获所有未知错误并返回详细信息
+            error_msg = f"💥 发生未知错误：{type(e).__name__}: {str(e)}"
+            # 在 Streamlit 日志中打印，方便调试
+            import sys
+            print(f"ERROR DETAILS: {error_msg}", file=sys.stderr)
+            return False, error_msg
 
     def add_history(self, action, details):
         """添加修改历史 (本地存储，简化版)"""
