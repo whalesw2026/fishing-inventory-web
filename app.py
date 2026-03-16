@@ -99,8 +99,9 @@ elif choice == "➕ 新增物品":
     with st.form("add_form"):
         c1, c2 = st.columns(2)
         with c1:
-            brand = st.text_input("品牌 (Brand)*", required=True)
-            name = st.text_input("物品名称 (Name)*", required=True)
+            # 【修改点】去掉了 required=True
+            brand = st.text_input("品牌 (Brand)*")
+            name = st.text_input("物品名称 (Name)*")
             category = st.selectbox("类别", ["鱼钩", "鱼线", "拟饵", "配件", "鱼竿", "其他"])
             warehouse = st.selectbox("所属仓库", ["主仓库", "分店A", "车载箱", "家中"])
             location = st.text_input("库位 (如 A-01)", "")
@@ -114,14 +115,19 @@ elif choice == "➕ 新增物品":
         submitted = st.form_submit_button("💾 保存并同步到 GitHub")
 
         if submitted:
-            with st.spinner("正在连接 GitHub 并写入数据..."):
-                success, msg = db.add_item(brand, name, category, warehouse, location, quantity, min_stock, unit_price,
-                                           batch_no, expiry_date)
-                if success:
-                    st.success(msg)
-                    refresh_data()
-                else:
-                    st.error(msg)
+            # 【新增】手动检查必填项
+            if not brand or not name:
+                st.error("❌ 请填写必填项：品牌和物品名称！")
+            else:
+                with st.spinner("正在连接 GitHub 并写入数据..."):
+                    success, msg = db.add_item(brand, name, category, warehouse, location, quantity, min_stock,
+                                               unit_price, batch_no, expiry_date)
+                    if success:
+                        st.success(msg)
+                        # 清空表单缓存或刷新
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
 elif choice == "✏️ 编辑/出入库":
     st.header("编辑与快速出入库")
