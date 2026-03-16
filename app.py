@@ -360,4 +360,171 @@ def render_transfer():
                 if df[mask_dst].empty:
                     new_id = int(df['id'].max()) + 1 if not df.empty and 'id' in df.columns else 1
                     new_row = pd.DataFrame([{
-                        'id': new_id, 'warehouse': dst_wh, 'brand':
+                        'id': new_id, 'warehouse': dst_wh, 'brand': b, 'item': i,
+                        'quantity': qty, 'image': '', 'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }])
+                    df = pd.concat([df, new_row], ignore_index=True)
+                else:
+                    df.loc[mask_dst, 'quantity'] += qty
+                    df.loc[mask_dst, 'updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                success, err = db.save_data(df)
+                if success:
+                    st.success(f"调拨成功：{qty} 件 {b}-{i} -> {dst_wh}")
+                    db.add_history("调拨", f"{qty}件 {b}-{i}: {src_wh}->{dst_wh}")
+                    st.rerun()
+                else:
+                    st.error(err)
+            else:
+                st.error("库存不足或物品不存在。")
+                st.rerun()
+
+
+def render_delete():
+    st.header("❌ 删除物品")
+    if not db.token: st.stop()
+    # 强制刷新
+    df = db.load_data(force_refresh=True)
+    df_wh = df[df['warehouse'] == current_warehouse]
+    if df_wh.empty: st.warning("无数据"); return
+
+    options = [f"{row['brand']} - {row['item']} (数量: {row['quantity']})" for _, row in df_wh.iterrows()]
+    sel = st.selectbox("选择记录", options, key="del_sel")
+
+    if sel and st.button("确认删除", type="primary", key="del_btn"):
+        parts = sel.split(" (数量: ")
+        b, i = parts[0].split(" - ")
+
+        # 再次刷新以确保删除的是最新存在的记录
+        df = db.load_data(force_refresh=True)
+        mask = (df['brand'] == b) & (df['item'] == i) & (df['warehouse'] == current_warehouse)
+
+        if not df[mask].empty:
+            df = df[~mask]
+            success, err = db.save_data(df)
+            if success:
+                st.success("删除成功！列表将刷新...")
+                db.add_history("删除", f"{b}-{i}")
+                st.rerun()
+            else:
+                st.error(err)
+                if "409" in err:
+                    st.info("💡 数据有冲突，已自动重试。若仍失败请刷新页面。")
+        else:
+            st.warning("该物品似乎已被删除或不存在。")
+            st.rerun()
+
+
+def render_import_excel():
+    st.header("📥 Excel 导入")
+    uploaded = st.file_uploader("上传 Excel", type=['xlsx', 'xls'], key="imp_file")
+    target_wh = st.selectbox("导入到", get_default_warehouses(), key="imp_wh")
+
+    if uploaded:
+        try:
+            df_in = pd.read_excel(uploaded)
+            if not all(k in df_in.columns for k in ['品牌', '物品', '数量']):
+                st.error("缺少列：品牌，物品，数量")
+                st.stop()
+
+            df_in = df_in.rename(columns={'品牌': 'brand', '物品': 'item', '数量': 'quantity', '图片路径': 'image'})
+            df_in['warehouse'] = target_wh
+            df_in['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if 'image' not in df_in.columns: df_in['image'] = ""
+
+            # 获取最新数据
+            df_curr = db.load_data(force_refresh=True)
+            count_add, count_upd = 0, 0
+
+            for _, row in df_in.iterrows():
+                mask = (df_curr['brand'] == row['brand']) & (df_curr['item'] == row['item']) & (
+                            df_curr['warehouse'] == target_wh)
+                if df_curr[mask].empty:
+                    new_id = int(df_curr['id'].max()) + 1 if not df_curr.empty and 'id' in df_curr.columns else 1
+                    new_row = pd.DataFrame([{
+                        'id': new_id, 'warehouse': target_wh, 'brand': row['brand'], 'item': row['item'],
+                        'quantity': int(row['quantity']), 'image': row.get('image', ''),
+                        'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }])
+                    df_curr = pd.concat([df_curr, new_row], ignore_index=True)
+                    count_add += 1
+                else:
+                    df_curr.loc[mask, 'quantity'] += int(row['quantity'])
+                    df_curr.loc[mask, 'updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    count_upd += 1
+
+            success, err = db.save_data(df_curr)
+            if success:
+                st.success(f"导入完成：新增 {count_add}, 更新 {count_upd}")
+                db.add_history("导入", f"{uploaded.name}: +{count_add}, ~{count_upd}")
+                st.rerun()
+            else:
+                st.error(err)
+        except Exception as e:
+            st.error(f"读取失败：{e}")
+
+
+def render_export_excel():
+    st.header("📤 Excel 导出")
+    df = db.load_data()
+    if df.empty: st.warning("无数据"); return
+
+    export_df = df[['warehouse', 'brand', 'item', 'quantity', 'image']].copy()
+    export_df.columns = ['仓库', '品牌', '物品', '数量', '图片路径']
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        export_df.to_excel(writer, index=False)
+
+    st.download_button("下载 Excel", buffer.getvalue(), f"inventory_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_btn")
+
+
+def render_history():
+    st.header("📝 修改历史")
+    history = db.get_history()
+    if not history:
+        st.info("暂无记录")
+    else:
+        for r in reversed(history[-20:]):
+            st.markdown(f"**[{r['timestamp']}] {r['action']}**: {r['details']}")
+            st.divider()
+
+
+def render_status():
+    st.header("🔧 系统状态")
+    if db.token:
+        st.success("✅ Token 已配置")
+        st.success(f"✅ 仓库：{db.repo_name}")
+        if st.button("刷新数据状态"):
+            load_data_cached.clear()
+            st.rerun()
+        df = db.load_data()
+        st.metric("记录数", len(df))
+    else:
+        st.error("❌ 未配置 Token")
+
+
+# --- 路由 ---
+if choice == "📦 库存总览":
+    tab1, tab2 = st.tabs(["当前仓库", "全仓汇总"])
+    with tab1:
+        render_inventory_view(db.load_data(), current_warehouse, False)
+    with tab2:
+        render_inventory_view(db.load_data(), "", True)
+elif choice == "➕ 新增/入库":
+    render_add_item()
+elif choice == "✏️ 修改数量":
+    render_update_qty()
+elif choice == "🔄 跨仓调拨":
+    render_transfer()
+elif choice == "❌ 删除物品":
+    render_delete()
+elif choice == "📥 Excel导入":
+    render_import_excel()
+elif choice == "📤 Excel导出":
+    render_export_excel()
+elif choice == "📝 修改历史":
+    render_history()
+elif choice == "🔧 系统状态":
+    render_status()
